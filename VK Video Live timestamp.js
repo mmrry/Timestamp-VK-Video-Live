@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VK Video Live — точное время VOD и Моментов
 // @namespace    vkvideo-vod-exact-time
-// @version      1.1.2
+// @version      1.2.0
 // @description  Показывает точную дату и время (ДД.ММ.ГГГГ ЧЧ:ММ:СС) начала стрима для VOD и создания Моментов (клипов) на live.vkvideo.ru
 // @author       Aaa
 // @match        https://live.vkvideo.ru/*
@@ -23,10 +23,17 @@
     // ("вчера", "2 дня назад" и т.п.) на точное время.
     // Если false — точное время просто добавляется отдельной строкой.
     const REPLACE_RELATIVE_DATE = true;
+
+    // Сколько запросов к API выполнять одновременно
+    const MAX_CONCURRENT = 3;
+    // Пауза всей очереди после ответа 429 (мс)
+    const RATE_LIMIT_PAUSE_MS = 5000;
+    // Таймаут одного запроса (мс)
+    const REQUEST_TIMEOUT_MS = 10000;
     // ===============================================
 
     const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
-    // id -> { startTime, createdAt }
+    // id -> { startTime, createdAt, kind }
     const timesById = new Map();
     let decorateScheduled = false;
 
@@ -52,22 +59,19 @@
     }
 
     // ---------- Сбор данных из JSON-ответов API ----------
-    // Рекурсивно обходим любой JSON и собираем:
+    // Рекурсивно обходим JSON и собираем:
     //  - записи VOD: id (UUID) + startTime/createdAt
-    //  - клипы (Моменты): id (UUID) + createdAt (+ recordId/videoCreatedAt), без startTime
+    //  - клипы (Моменты): id (UUID) + createdAt, без startTime
     function harvest(obj) {
         if (!obj || typeof obj !== 'object') return;
         if (Array.isArray(obj)) { obj.forEach(harvest); return; }
 
         if (typeof obj.id === 'string' && UUID_RE.test(obj.id) &&
             (typeof obj.startTime === 'number' || typeof obj.createdAt === 'number')) {
-            const isClip = typeof obj.startTime !== 'number' &&
-                (typeof obj.recordId === 'string' || typeof obj.videoCreatedAt === 'number' ||
-                 typeof obj.createdAt === 'number');
             timesById.set(obj.id.toLowerCase(), {
                 startTime: obj.startTime,
                 createdAt: obj.createdAt,
-                kind: (typeof obj.startTime === 'number') ? 'record' : (isClip ? 'clip' : 'record')
+                kind: (typeof obj.startTime === 'number') ? 'record' : 'clip'
             });
             scheduleDecorate();
         }
@@ -76,59 +80,72 @@
         }
     }
 
-    // ---------- Перехват fetch ----------
-    const origFetch = window.fetch;
-    window.fetch = function (...args) {
-        const p = origFetch.apply(this, args);
-        try {
-            const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
-            if (url.includes('api.live.vkvideo.ru')) {
-                p.then(resp => {
-                    resp.clone().json().then(harvest).catch(() => {});
-                    return resp;
-                }).catch(() => {});
-            }
-        } catch (e) { /* ignore */ }
-        return p;
-    };
-
-    // ---------- Перехват XMLHttpRequest ----------
-    const origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-        this.__vkvod_url = url;
-        return origOpen.call(this, method, url, ...rest);
-    };
-    const origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function (...args) {
-        if (this.__vkvod_url && String(this.__vkvod_url).includes('api.live.vkvideo.ru')) {
-            this.addEventListener('load', () => {
-                try { harvest(JSON.parse(this.responseText)); } catch (e) { /* not JSON */ }
-            });
-        }
-        return origSend.apply(this, args);
-    };
-
-    // ---------- Прямой запрос к API (fallback для страницы записи/клипа) ----------
+    // ---------- Запросы к API с очередью ----------
+    // requestedIds: ключи, которые уже в очереди, в работе или успешно получены.
+    // При временной ошибке ключ удаляется, и следующий проход декоратора
+    // поставит элемент в очередь заново.
     const requestedIds = new Set();
+    const queue = [];
+    let active = 0;
+    let pausedUntil = 0;
+    let pumpTimer = null;
+
+    function pump() {
+        while (active < MAX_CONCURRENT && queue.length) {
+            const wait = pausedUntil - Date.now();
+            if (wait > 0) {
+                if (!pumpTimer) {
+                    pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, wait);
+                }
+                return;
+            }
+            const job = queue.shift();
+            active++;
+            runJob(job);
+        }
+    }
+
+    function runJob(job) {
+        let finished = false;
+        const done = (retry) => {
+            if (finished) return;
+            finished = true;
+            if (retry) requestedIds.delete(job.key);
+            active--;
+            pump();
+        };
+
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: job.url,
+            timeout: REQUEST_TIMEOUT_MS,
+            onload: (r) => {
+                if (r.status === 429) {
+                    pausedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
+                    done(true);
+                    return;
+                }
+                if (r.status >= 500) { done(true); return; }   // временная ошибка — повторим
+                if (r.status !== 200) { done(false); return; } // 404/403 — не долбим повторно
+                try { harvest(JSON.parse(r.responseText)); } catch (e) { /* ignore */ }
+                done(false);
+            },
+            onerror: () => done(true),
+            ontimeout: () => done(true),
+            onabort: () => done(true)
+        });
+    }
+
     function fetchItem(blog, kind, itemId) {
         const key = kind + '/' + blog + '/' + itemId;
         if (requestedIds.has(key)) return;
         requestedIds.add(key);
-        const apiUrl = (kind === 'clip')
+        const url = (kind === 'clip')
             ? 'https://api.live.vkvideo.ru/v1/channel/' + encodeURIComponent(blog) + '/clip/' + itemId
             : 'https://api.live.vkvideo.ru/v1/blog/' + encodeURIComponent(blog) +
               '/public_video_stream/record/' + itemId;
-              GM_xmlhttpRequest({
-                  method: 'GET',
-                  url: apiUrl,
-                  onload: (r) => {
-                      if (r.status !== 200) { requestedIds.delete(key); return; }
-                      try { harvest(JSON.parse(r.responseText)); } catch (e) { /* ignore */ }
-                  },
-                  onerror: () => requestedIds.delete(key),
-                  ontimeout: () => requestedIds.delete(key),
-                  timeout: 10000
-              });
+        queue.push({ key, url });
+        pump();
     }
 
     // ---------- Стили ----------
@@ -166,9 +183,8 @@
     }
 
     // ---------- Точное время на карточках VOD и Моментов ----------
-    // Карточка записи: a[data-test-id="RecordCard:root"][href="/<blog>/record/<uuid>"]
-    // Карточка момента: a[href="/<blog>/clip/<uuid>"] (та же компонента VideoInfo)
-    // Относительная дата лежит в <div class="VideoInfo_passed_XXXXX">7 ч. назад</div>
+    // Карточка записи: a[href="/<blog>/record/<uuid>"]
+    // Карточка момента: a[href="/<blog>/clip/<uuid>"]
     // Хэш-суффиксы классов меняются между сборками, поэтому матчим по префиксу.
     function decoratePreviews() {
         document.querySelectorAll('a[href*="/record/"], a[href*="/clip/"]').forEach(a => {
@@ -182,7 +198,6 @@
             const info = timesById.get(uuid);
             const ts = getTs(info);
             if (!ts) {
-                // Список пришёл через SSR и API-запроса не было — тянем данные сами.
                 fetchItem(blog, kind, uuid);
                 return;
             }
@@ -191,7 +206,6 @@
             const tip = getTooltip(info);
 
             // 1) Основной путь: заменяем текст элемента с относительной датой
-            // Записи: VideoInfo_passed_XXXXX; Моменты: VideoClipCard_passed_XXXXX
             const passed = a.querySelector(
                 '[class*="VideoInfo_passed"], [class*="VideoClipCard_passed"], [class*="_passed_"]'
             );
@@ -203,7 +217,7 @@
                 return;
             }
 
-            // 2) Fallback: если разметка изменилась — бейдж поверх превью
+            // 2) Fallback: бейдж поверх превью
             let badge = a.querySelector(':scope .vkvod-badge');
             if (badge) {
                 if (badge.textContent !== text) badge.textContent = text;
@@ -230,9 +244,8 @@
         const kind = pm[2].toLowerCase();
         const itemId = pm[3].toLowerCase();
 
-        let info = timesById.get(itemId);
+        const info = timesById.get(itemId);
         if (!info) {
-            // Данных ещё нет (SSR / прямой заход) — тянем из API сами
             fetchItem(blog, kind, itemId);
             return;
         }
@@ -244,20 +257,19 @@
 
         // 1) Пробуем заменить относительную дату
         if (REPLACE_RELATIVE_DATE) {
-            // 1а) По классу (та же компонента, что и на карточках).
-            // Важно: берём элемент вне карточек списка, чтобы не задеть превью других видео.
+            // 1а) По классу, вне карточек списка
             const passedAll = document.querySelectorAll(
                 '[class*="VideoInfo_passed"], [class*="VideoClipCard_passed"], [class*="_passed_"]'
             );
             for (const passed of passedAll) {
-                if (passed.closest('a[href*="/record/"], a[href*="/clip/"]')) continue; // это карточка списка
+                if (passed.closest('a[href*="/record/"], a[href*="/clip/"]')) continue;
                 if (passed.textContent !== text) {
                     passed.textContent = text;
                     passed.title = tip;
                 }
                 return;
             }
-            // 1б) Эвристика по тексту, если класс не нашёлся
+            // 1б) Эвристика по тексту
             const candidates = document.querySelectorAll('span, div, time, p');
             for (const el of candidates) {
                 if (el.childElementCount !== 0) continue;
@@ -277,7 +289,7 @@
             }
         }
 
-        // 2) Fallback: добавляем отдельную строку под заголовком
+        // 2) Fallback: отдельная строка под заголовком
         const want = label + text;
         const ex = document.querySelector('.vkvod-page-time');
         if (ex) {
@@ -321,7 +333,7 @@
         history.replaceState = function (...a) { const r = origReplace.apply(this, a); scheduleDecorate(); return r; };
         window.addEventListener('popstate', scheduleDecorate);
 
-        // Подстраховка: периодический проход (лениво, раз в 3 сек)
+        // Подстраховка: периодический проход раз в 3 сек
         setInterval(scheduleDecorate, 3000);
 
         scheduleDecorate();
