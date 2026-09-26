@@ -118,13 +118,17 @@
             ? 'https://api.live.vkvideo.ru/v1/channel/' + encodeURIComponent(blog) + '/clip/' + itemId
             : 'https://api.live.vkvideo.ru/v1/blog/' + encodeURIComponent(blog) +
               '/public_video_stream/record/' + itemId;
-        GM_xmlhttpRequest({
-            method: 'GET',
-            url: apiUrl,
-            onload: (r) => {
-                try { harvest(JSON.parse(r.responseText)); } catch (e) { /* ignore */ }
-            }
-        });
+              GM_xmlhttpRequest({
+                  method: 'GET',
+                  url: apiUrl,
+                  onload: (r) => {
+                      if (r.status !== 200) { requestedIds.delete(key); return; }
+                      try { harvest(JSON.parse(r.responseText)); } catch (e) { /* ignore */ }
+                  },
+                  onerror: () => requestedIds.delete(key),
+                  ontimeout: () => requestedIds.delete(key),
+                  timeout: 10000
+              });
     }
 
     // ---------- Стили ----------
