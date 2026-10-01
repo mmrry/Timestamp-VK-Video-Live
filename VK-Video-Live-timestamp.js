@@ -9,6 +9,7 @@
 // @grant        unsafeWindow
 // @connect      api.live.vkvideo.ru
 // @run-at       document-start
+// @license MIT
 // ==/UserScript==
 
 (function () {
